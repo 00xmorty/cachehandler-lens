@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Bounded, offline, read-only inspection of app document handler declarations."""
+import argparse
+import os
+import plistlib
+import re
+import sys
+
+MAX_ENTRIES = 10000
+MAX_APPS = 100
+MAX_PLIST = 1024 * 1024
+SAFE_TYPE = re.compile(r"^[A-Za-z0-9+_.-]{1,64}$")
+RANKS = {"Owner", "Default", "Alternate", "None"}
+
+
+def scan(root):
+    if not os.path.isdir(root) or os.path.islink(root):
+        raise ValueError("root must be a real directory, not a symlink")
+    entries = apps = 0
+    for current, dirs, _ in os.walk(root, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(current, d)))
+        entries += len(dirs)
+        if entries > MAX_ENTRIES:
+            raise ValueError("scan bound exceeded (10000 directory entries)")
+        bundles = [d for d in dirs if d.lower().endswith(".app")]
+        dirs[:] = [d for d in dirs if d not in bundles]
+        for bundle in bundles:
+            apps += 1
+            if apps > MAX_APPS:
+                raise ValueError("scan bound exceeded (100 apps)")
+            info = os.path.join(current, bundle, "Contents", "Info.plist")
+            if os.path.islink(info) or not os.path.isfile(info):
+                continue
+            try:
+                if os.path.getsize(info) > MAX_PLIST:
+                    raise ValueError("plist too large")
+                with open(info, "rb") as handle:
+                    data = plistlib.load(handle)
+                if not isinstance(data, dict):
+                    raise ValueError("invalid plist root")
+            except (OSError, ValueError, TypeError, plistlib.InvalidFileException):
+                print(f"App #{apps}: unreadable/invalid plist (UNKNOWN)")
+                continue
+            types = data.get("CFBundleDocumentTypes", [])
+            if not isinstance(types, list):
+                print(f"App #{apps}: invalid document types (UNKNOWN)")
+                continue
+            print(f"App #{apps}: {len(types)} declared document type(s)")
+            for item in types[:100]:
+                if not isinstance(item, dict):
+                    continue
+                rank = item.get("LSHandlerRank")
+                rank = rank if isinstance(rank, str) and rank in RANKS else "UNKNOWN"
+                extensions = item.get("CFBundleTypeExtensions", [])
+                if not isinstance(extensions, list):
+                    extensions = []
+                safe = sorted({s for s in extensions if isinstance(s, str) and SAFE_TYPE.fullmatch(s)})
+                print(f"  rank={rank} extensions={','.join(safe[:20]) or 'UNKNOWN'}")
+    print(f"Scan complete: {apps} app bundle(s); registration=UNKNOWN; actual default=UNKNOWN")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", required=True, help="local directory to inspect (never printed)")
+    args = parser.parse_args()
+    try:
+        scan(args.root)
+    except (OSError, ValueError) as error:
+        print(f"Scan incomplete: {error}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

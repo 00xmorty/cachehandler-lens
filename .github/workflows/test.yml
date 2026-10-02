@@ -1,0 +1,19 @@
+name: Test
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax and fixture tests
+        run: |
+          python3 -m py_compile cachehandler-lens
+          python3 -m unittest discover -s tests -v
+          python3 cachehandler-lens --help
