@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Bounded, offline, read-only inspection of app document handler declarations."""
 import argparse
+import json
 import os
 import plistlib
 import re
+import stat
 import sys
 
 MAX_ENTRIES = 10000
@@ -13,62 +15,96 @@ SAFE_TYPE = re.compile(r"^[A-Za-z0-9+_.-]{1,64}$")
 RANKS = {"Owner", "Default", "Alternate", "None"}
 
 
+def safe_types(value):
+    if not isinstance(value, list):
+        return []
+    return sorted({s for s in value if isinstance(s, str) and SAFE_TYPE.fullmatch(s)})[:20]
+
+
 def scan(root):
     if not os.path.isdir(root) or os.path.islink(root):
         raise ValueError("root must be a real directory, not a symlink")
-    entries = apps = 0
-    for current, dirs, _ in os.walk(root, followlinks=False):
+    report = {"schema_version": 1, "complete": True, "apps": [],
+              "registration": "UNKNOWN", "actual_default": "UNKNOWN"}
+    entries = 0
+
+    def walk_error(_):
+        report["complete"] = False
+
+    for current, dirs, _ in os.walk(root, followlinks=False, onerror=walk_error):
         dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(current, d)))
         entries += len(dirs)
         if entries > MAX_ENTRIES:
-            raise ValueError("scan bound exceeded (10000 directory entries)")
+            report["complete"] = False
+            break
         bundles = [d for d in dirs if d.lower().endswith(".app")]
         dirs[:] = [d for d in dirs if d not in bundles]
         for bundle in bundles:
-            apps += 1
-            if apps > MAX_APPS:
-                raise ValueError("scan bound exceeded (100 apps)")
-            info = os.path.join(current, bundle, "Contents", "Info.plist")
-            if os.path.islink(info) or not os.path.isfile(info):
+            if len(report["apps"]) >= MAX_APPS:
+                report["complete"] = False
+                return report
+            app = {"id": len(report["apps"]) + 1, "status": "UNKNOWN",
+                   "declared_count": None, "truncated": False, "document_types": []}
+            report["apps"].append(app)
+            contents = os.path.join(current, bundle, "Contents")
+            info = os.path.join(contents, "Info.plist")
+            # Reject intermediate symlinks, including root ancestors.
+            if os.path.realpath(info) != os.path.abspath(info):
                 continue
             try:
-                if os.path.getsize(info) > MAX_PLIST:
-                    raise ValueError("plist too large")
+                if not stat.S_ISREG(os.lstat(info).st_mode):
+                    continue
                 with open(info, "rb") as handle:
-                    data = plistlib.load(handle)
+                    payload = handle.read(MAX_PLIST + 1)
+                if len(payload) > MAX_PLIST:
+                    raise ValueError("plist too large")
+                data = plistlib.loads(payload)
                 if not isinstance(data, dict):
                     raise ValueError("invalid plist root")
+                types = data.get("CFBundleDocumentTypes", [])
+                if not isinstance(types, list):
+                    raise ValueError("invalid document types")
             except (OSError, ValueError, TypeError, plistlib.InvalidFileException):
-                print(f"App #{apps}: unreadable/invalid plist (UNKNOWN)")
                 continue
-            types = data.get("CFBundleDocumentTypes", [])
-            if not isinstance(types, list):
-                print(f"App #{apps}: invalid document types (UNKNOWN)")
-                continue
-            print(f"App #{apps}: {len(types)} declared document type(s)")
+            app.update(status="OK", declared_count=len(types), truncated=len(types) > 100)
             for item in types[:100]:
                 if not isinstance(item, dict):
+                    app["document_types"].append({"rank": "UNKNOWN", "extensions": [], "utis": []})
                     continue
                 rank = item.get("LSHandlerRank")
                 rank = rank if isinstance(rank, str) and rank in RANKS else "UNKNOWN"
-                extensions = item.get("CFBundleTypeExtensions", [])
-                if not isinstance(extensions, list):
-                    extensions = []
-                safe = sorted({s for s in extensions if isinstance(s, str) and SAFE_TYPE.fullmatch(s)})
-                print(f"  rank={rank} extensions={','.join(safe[:20]) or 'UNKNOWN'}")
-    print(f"Scan complete: {apps} app bundle(s); registration=UNKNOWN; actual default=UNKNOWN")
+                app["document_types"].append({"rank": rank,
+                    "extensions": safe_types(item.get("CFBundleTypeExtensions")),
+                    "utis": safe_types(item.get("LSItemContentTypes"))})
+    return report
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", required=True, help="local directory to inspect (never printed)")
+    parser.add_argument("--json", action="store_true", help="value-filtered structured report")
     args = parser.parse_args()
     try:
-        scan(args.root)
-    except (OSError, ValueError) as error:
-        print(f"Scan incomplete: {error}", file=sys.stderr)
-        return 2
-    return 0
+        report = scan(args.root)
+    except (OSError, ValueError):
+        report = {"schema_version": 1, "complete": False, "apps": [],
+                  "registration": "UNKNOWN", "actual_default": "UNKNOWN"}
+    if args.json:
+        print(json.dumps(report, sort_keys=True))
+    else:
+        for app in report["apps"]:
+            if app["status"] == "UNKNOWN":
+                print(f"App #{app['id']}: unreadable/invalid plist (UNKNOWN)")
+                continue
+            print(f"App #{app['id']}: {app['declared_count']} declared document type(s)")
+            for item in app["document_types"]:
+                print(f"  rank={item['rank']} extensions={','.join(item['extensions']) or 'UNKNOWN'}"
+                      f" utis={','.join(item['utis']) or 'UNKNOWN'}")
+            if app["truncated"]:
+                print("  Document type output truncated to 100 entries")
+        state = "complete" if report["complete"] else "incomplete"
+        print(f"Scan {state}: {len(report['apps'])} app bundle(s); registration=UNKNOWN; actual default=UNKNOWN")
+    return 0 if report["complete"] else 2
 
 
 if __name__ == "__main__":
